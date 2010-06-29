@@ -5578,12 +5578,8 @@ static void brpoplpushcommand(redisClient *c) {
     time_t timeout;
     int j;
 
-    int src_keys_count = c->argc-3;
+    int src_keys_count = c->argc-2;
     int dst_idx = c->argc-2;
-    int timeout_idx = c->argc;
-
-
-
 
     for (j = 1; j < src_keys_count; j++) {
         sobj = lookupKeyWrite(c->db, c->argv[j]);
@@ -5610,7 +5606,7 @@ static void brpoplpushcommand(redisClient *c) {
 
                     /* Send the element to the client as reply as well */
                     addReplySds(c,sdsnew("*2\r\n"));
-                    addReplyBulk(c,sobj);
+                    addReplyBulk(c,c->argv[j]);
                     addReplyBulk(c,value);
 
                     /* listTypePop returns an object with its refcount incremented */
@@ -8291,6 +8287,7 @@ static int handleClientsWaitingListPush(redisClient *c, robj *key, robj *ele) {
         }
         listTypePush(dobj, ele, REDIS_HEAD);
         decrRefCount(receiver->blocking_dest_key);
+        receiver->blocking_dest_key = NULL;
     }
 
     addReplySds(receiver,sdsnew("*2\r\n"));
