@@ -8192,8 +8192,8 @@ static void blockForKeys(redisClient *c, robj **keys, int numkeys, robj *dest_ke
     c->blocking_keys = zmalloc(sizeof(robj*)*numkeys);
     c->blocking_keys_num = numkeys;
     c->blocking_dest_key = dest_key;
-    incrRefCount(dest_key);
     c->blockingto = timeout;
+    if (dest_key != NULL) incrRefCount(dest_key);
     for (j = 0; j < numkeys; j++) {
         /* Add the key in the client structure, to map clients -> keys */
         c->blocking_keys[j] = keys[j];
