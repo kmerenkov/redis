@@ -345,6 +345,7 @@ typedef struct redisClient {
     robj **blocking_keys;   /* The key we are waiting to terminate a blocking
                              * operation such as BLPOP. Otherwise NULL. */
     int blocking_keys_num;  /* Number of blocking keys */
+    robj *blocking_dest_key; /* After popping move elements to the dest_key unless NULL */
     time_t blockingto;      /* Blocking operation timeout. If UNIX current time
                              * is >= blockingto then the operation timed out. */
     list *io_keys;          /* Keys this client is waiting to be loaded from the
@@ -577,6 +578,7 @@ typedef struct iojob {
 char *redisGitSHA1(void);
 char *redisGitDirty(void);
 
+static void blockForKeys(redisClient *c, robj **keys, int numkeys, robj *dest_key, time_t timeout);
 static void freeStringObject(robj *o);
 static void freeListObject(robj *o);
 static void freeSetObject(robj *o);
@@ -723,6 +725,7 @@ static void flushallCommand(redisClient *c);
 static void sortCommand(redisClient *c);
 static void lremCommand(redisClient *c);
 static void rpoplpushcommand(redisClient *c);
+static void brpoplpushcommand(redisClient *c);
 static void infoCommand(redisClient *c);
 static void mgetCommand(redisClient *c);
 static void monitorCommand(redisClient *c);
@@ -810,6 +813,7 @@ static struct redisCommand readonlyCommandTable[] = {
     {"ltrim",ltrimCommand,4,REDIS_CMD_INLINE,NULL,1,1,1},
     {"lrem",lremCommand,4,REDIS_CMD_BULK,NULL,1,1,1},
     {"rpoplpush",rpoplpushcommand,3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM,NULL,1,2,1},
+    {"brpoplpush",brpoplpushcommand,4,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM,NULL,1,2,1},
     {"sadd",saddCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM,NULL,1,1,1},
     {"srem",sremCommand,3,REDIS_CMD_BULK,NULL,1,1,1},
     {"smove",smoveCommand,4,REDIS_CMD_BULK,NULL,1,2,1},
@@ -2835,6 +2839,7 @@ static redisClient *createClient(int fd) {
     listSetDupMethod(c->reply,dupClientReplyValue);
     c->blocking_keys = NULL;
     c->blocking_keys_num = 0;
+    c->blocking_dest_key = NULL;
     c->io_keys = listCreate();
     c->watched_keys = listCreate();
     listSetFreeMethod(c->io_keys,decrRefCount);
@@ -5568,6 +5573,45 @@ static void rpoplpushcommand(redisClient *c) {
     }
 }
 
+static void brpoplpushcommand(redisClient *c) {
+    robj *sobj, *value;
+    time_t timeout;
+
+    sobj = lookupKeyWrite(c->db, c->argv[1]);
+    if ((sobj == NULL) || ((sobj != NULL) && (listTypeLength(sobj) == 0))) {
+        timeout = strtol(c->argv[c->argc-1]->ptr,NULL,10);
+        if (timeout > 0) timeout += time(NULL);
+        blockForKeys(c,c->argv+1,1,c->argv[2],timeout);
+    } else {
+        robj *dobj = lookupKeyWrite(c->db,c->argv[2]);
+        if (dobj && checkType(c,dobj,REDIS_LIST)) return;
+        value = listTypePop(sobj,REDIS_TAIL);
+
+        /* Add the element to the target list (unless it's directly
+         * passed to some BLPOP-ing client */
+        if (!handleClientsWaitingListPush(c,c->argv[2],value)) {
+            /* Create the list if the key does not exist */
+            if (!dobj) {
+                dobj = createZiplistObject();
+                dbAdd(c->db,c->argv[2],dobj);
+            }
+            listTypePush(dobj,value,REDIS_HEAD);
+        }
+
+        /* Send the element to the client as reply as well */
+        addReplySds(c,sdsnew("*2\r\n"));
+        addReplyBulk(c,c->argv[1]);
+        addReplyBulk(c,value);
+
+        /* listTypePop returns an object with its refcount incremented */
+        decrRefCount(value);
+
+        /* Delete the source list when it is empty */
+        if (listTypeLength(sobj) == 0) dbDelete(c->db,c->argv[1]);
+        server.dirty++;
+    }
+}
+
 /* ==================================== Sets ================================ */
 
 static void saddCommand(redisClient *c) {
@@ -8127,13 +8171,15 @@ static void execCommand(redisClient *c) {
 
 /* Set a client in blocking mode for the specified key, with the specified
  * timeout */
-static void blockForKeys(redisClient *c, robj **keys, int numkeys, time_t timeout) {
+static void blockForKeys(redisClient *c, robj **keys, int numkeys, robj *dest_key, time_t timeout) {
     dictEntry *de;
     list *l;
     int j;
 
     c->blocking_keys = zmalloc(sizeof(robj*)*numkeys);
     c->blocking_keys_num = numkeys;
+    c->blocking_dest_key = dest_key;
+    incrRefCount(dest_key);
     c->blockingto = timeout;
     for (j = 0; j < numkeys; j++) {
         /* Add the key in the client structure, to map clients -> keys */
@@ -8215,6 +8261,21 @@ static int handleClientsWaitingListPush(redisClient *c, robj *key, robj *ele) {
     assert(ln != NULL);
     receiver = ln->value;
 
+    if (receiver->blocking_dest_key != NULL) {
+        /* Create the list if the key does not exist */
+        robj *dobj = lookupKeyWrite(receiver->db, receiver->blocking_dest_key);
+        if (dobj && checkType(receiver,dobj,REDIS_LIST)) {
+            addReply(receiver,shared.wrongtypeerr);
+            return 0;
+        }
+        if (!dobj) {
+            dobj = createZiplistObject();
+            dbAdd(receiver->db,receiver->blocking_dest_key,dobj);
+        }
+        listTypePush(dobj, ele, REDIS_HEAD);
+        decrRefCount(receiver->blocking_dest_key);
+    }
+
     addReplySds(receiver,sdsnew("*2\r\n"));
     addReplyBulk(receiver,key);
     addReplyBulk(receiver,ele);
@@ -8269,7 +8330,7 @@ static void blockingPopGenericCommand(redisClient *c, int where) {
     /* If the list is empty or the key does not exists we must block */
     timeout = strtol(c->argv[c->argc-1]->ptr,NULL,10);
     if (timeout > 0) timeout += time(NULL);
-    blockForKeys(c,c->argv+1,c->argc-2,timeout);
+    blockForKeys(c,c->argv+1,c->argc-2,NULL,timeout);
 }
 
 static void blpopCommand(redisClient *c) {
