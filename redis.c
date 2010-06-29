@@ -813,7 +813,7 @@ static struct redisCommand readonlyCommandTable[] = {
     {"ltrim",ltrimCommand,4,REDIS_CMD_INLINE,NULL,1,1,1},
     {"lrem",lremCommand,4,REDIS_CMD_BULK,NULL,1,1,1},
     {"rpoplpush",rpoplpushcommand,3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM,NULL,1,2,1},
-    {"brpoplpush",brpoplpushcommand,4,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM,NULL,1,2,1},
+    {"brpoplpush",brpoplpushcommand,-4,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM,NULL,0,0,0},
     {"sadd",saddCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM,NULL,1,1,1},
     {"srem",sremCommand,3,REDIS_CMD_BULK,NULL,1,1,1},
     {"smove",smoveCommand,4,REDIS_CMD_BULK,NULL,1,2,1},
@@ -5576,40 +5576,57 @@ static void rpoplpushcommand(redisClient *c) {
 static void brpoplpushcommand(redisClient *c) {
     robj *sobj, *value;
     time_t timeout;
+    int j;
 
-    sobj = lookupKeyWrite(c->db, c->argv[1]);
-    if ((sobj == NULL) || ((sobj != NULL) && (listTypeLength(sobj) == 0))) {
-        timeout = strtol(c->argv[c->argc-1]->ptr,NULL,10);
-        if (timeout > 0) timeout += time(NULL);
-        blockForKeys(c,c->argv+1,1,c->argv[2],timeout);
-    } else {
-        robj *dobj = lookupKeyWrite(c->db,c->argv[2]);
-        if (dobj && checkType(c,dobj,REDIS_LIST)) return;
-        value = listTypePop(sobj,REDIS_TAIL);
+    int src_keys_count = c->argc-3;
+    int dst_idx = c->argc-2;
+    int timeout_idx = c->argc;
 
-        /* Add the element to the target list (unless it's directly
-         * passed to some BLPOP-ing client */
-        if (!handleClientsWaitingListPush(c,c->argv[2],value)) {
-            /* Create the list if the key does not exist */
-            if (!dobj) {
-                dobj = createZiplistObject();
-                dbAdd(c->db,c->argv[2],dobj);
+
+
+
+    for (j = 1; j < src_keys_count; j++) {
+        sobj = lookupKeyWrite(c->db, c->argv[j]);
+        if (sobj != NULL) {
+            if (sobj->type != REDIS_LIST) {
+                addReply(c, shared.wrongtypeerr);
+                return;
+            } else {
+                if (listTypeLength(sobj) != 0) {
+                    robj *dobj = lookupKeyWrite(c->db,c->argv[dst_idx]);
+                    if (dobj && checkType(c,dobj,REDIS_LIST)) return;
+                    value = listTypePop(sobj,REDIS_TAIL);
+
+                    /* Add the element to the target list (unless it's directly
+                     * passed to some BLPOP-ing client */
+                    if (!handleClientsWaitingListPush(c,c->argv[dst_idx],value)) {
+                        /* Create the list if the key does not exist */
+                        if (!dobj) {
+                            dobj = createZiplistObject();
+                            dbAdd(c->db,c->argv[dst_idx],dobj);
+                        }
+                        listTypePush(dobj,value,REDIS_HEAD);
+                    }
+
+                    /* Send the element to the client as reply as well */
+                    addReplySds(c,sdsnew("*2\r\n"));
+                    addReplyBulk(c,sobj);
+                    addReplyBulk(c,value);
+
+                    /* listTypePop returns an object with its refcount incremented */
+                    decrRefCount(value);
+
+                    /* Delete the source list when it is empty */
+                    if (listTypeLength(sobj) == 0) dbDelete(c->db,sobj);
+                    server.dirty++;
+                    return;
+                }
             }
-            listTypePush(dobj,value,REDIS_HEAD);
         }
-
-        /* Send the element to the client as reply as well */
-        addReplySds(c,sdsnew("*2\r\n"));
-        addReplyBulk(c,c->argv[1]);
-        addReplyBulk(c,value);
-
-        /* listTypePop returns an object with its refcount incremented */
-        decrRefCount(value);
-
-        /* Delete the source list when it is empty */
-        if (listTypeLength(sobj) == 0) dbDelete(c->db,c->argv[1]);
-        server.dirty++;
     }
+    timeout = strtol(c->argv[c->argc-1]->ptr,NULL,10);
+    if (timeout > 0) timeout += time(NULL);
+    blockForKeys(c,c->argv+1,src_keys_count,c->argv[dst_idx],timeout);
 }
 
 /* ==================================== Sets ================================ */
